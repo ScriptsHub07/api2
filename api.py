@@ -4,21 +4,9 @@ import sqlite3
 from datetime import datetime
 import threading
 import time
-import queue
-import logging
+import concurrent.futures
 
 app = Flask(__name__)
-
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('brainrot_api.log')
-    ]
-)
-logger = logging.getLogger(__name__)
 
 # Configuração dos webhooks
 WEBHOOKS = {
@@ -31,56 +19,83 @@ WEBHOOKS = {
 # Configuração do banco de dados
 DB_FILE = "servers.db"
 
-# Fila para processamento assíncrono
-discord_queue = queue.Queue()
+# Pool de threads para envios paralelos
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+# Cache em memória para verificações rápidas
+server_cache = {}
+cache_lock = threading.Lock()
 
 def init_db():
     """Inicializa o banco de dados"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS sent_servers
+                 (job_id TEXT PRIMARY KEY,
+                  timestamp DATETIME,
+                  webhook_type TEXT,
+                  category TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sent_brainrot_150m
+                 (job_id TEXT PRIMARY KEY,
+                  timestamp DATETIME)''')
+    conn.commit()
+    conn.close()
+    
+    # Carregar cache
+    load_cache()
+
+def load_cache():
+    """Carrega cache do banco de dados"""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS sent_servers
-                     (job_id TEXT PRIMARY KEY,
-                      timestamp DATETIME,
-                      webhook_type TEXT,
-                      category TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS sent_brainrot_150m
-                     (job_id TEXT PRIMARY KEY,
-                      timestamp DATETIME)''')
-        conn.commit()
+        c.execute("SELECT job_id FROM sent_servers WHERE timestamp > datetime('now', '-6 hours')")
+        servers = c.fetchall()
+        c.execute("SELECT job_id FROM sent_brainrot_150m WHERE timestamp > datetime('now', '-6 hours')")
+        brainrots = c.fetchall()
         conn.close()
-        logger.info("✅ Banco de dados inicializado")
+        
+        with cache_lock:
+            server_cache.clear()
+            for job_id in servers:
+                server_cache[job_id[0]] = True
+            for job_id in brainrots:
+                server_cache[f"brainrot_{job_id[0]}"] = True
+        
+        print(f"📦 Cache carregado: {len(server_cache)} entradas")
     except Exception as e:
-        logger.error(f"❌ Erro ao inicializar banco: {e}")
+        print(f"❌ Erro ao carregar cache: {e}")
 
-def was_server_sent(job_id):
-    """Verifica se o servidor já foi enviado"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT job_id FROM sent_servers WHERE job_id = ?", (job_id,))
-        result = c.fetchone()
-        conn.close()
-        return result is not None
-    except Exception as e:
-        logger.error(f"Erro ao verificar servidor: {e}")
-        return False
+def was_server_sent_fast(job_id):
+    """Verificação rápida usando cache"""
+    with cache_lock:
+        return job_id in server_cache
 
-def was_brainrot_150m_sent(job_id):
-    """Verifica se o alerta brainrot 150M já foi enviado"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT job_id FROM sent_brainrot_150m WHERE job_id = ?", (job_id,))
-        result = c.fetchone()
-        conn.close()
-        return result is not None
-    except Exception as e:
-        logger.error(f"Erro ao verificar brainrot 150M: {e}")
-        return False
+def was_brainrot_150m_sent_fast(job_id):
+    """Verificação rápida usando cache"""
+    with cache_lock:
+        return f"brainrot_{job_id}" in server_cache
 
-def mark_server_sent(job_id, webhook_type, category):
-    """Marca o servidor como enviado"""
+def mark_server_sent_fast(job_id, webhook_type, category):
+    """Marca no cache e depois no banco em segundo plano"""
+    # Adicionar ao cache primeiro (rápido)
+    with cache_lock:
+        server_cache[job_id] = True
+    
+    # Salvar no banco em segundo plano
+    executor.submit(mark_server_sent_db, job_id, webhook_type, category)
+
+def mark_brainrot_150m_sent_fast(job_id):
+    """Marca no cache e depois no banco em segundo plano"""
+    # Adicionar ao cache primeiro (rápido)
+    with cache_lock:
+        server_cache[f"brainrot_{job_id}"] = True
+    
+    # Salvar no banco em segundo plano
+    executor.submit(mark_brainrot_150m_sent_db, job_id)
+
+def mark_server_sent_db(job_id, webhook_type, category):
+    """Marca no banco de dados (executado em segundo plano)"""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -88,12 +103,11 @@ def mark_server_sent(job_id, webhook_type, category):
                   (job_id, datetime.now(), webhook_type, category))
         conn.commit()
         conn.close()
-        logger.info(f"📝 Servidor marcado como enviado: {job_id}")
     except Exception as e:
-        logger.error(f"❌ Erro ao salvar no banco: {e}")
+        print(f"❌ Erro ao salvar no banco: {e}")
 
-def mark_brainrot_150m_sent(job_id):
-    """Marca o alerta brainrot 150M como enviado"""
+def mark_brainrot_150m_sent_db(job_id):
+    """Marca no banco de dados (executado em segundo plano)"""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -101,79 +115,110 @@ def mark_brainrot_150m_sent(job_id):
                   (job_id, datetime.now()))
         conn.commit()
         conn.close()
-        logger.info(f"📝 Brainrot 150M marcado como enviado: {job_id}")
     except Exception as e:
-        logger.error(f"❌ Erro ao salvar brainrot 150M: {e}")
+        print(f"❌ Erro ao salvar brainrot 150M: {e}")
 
-def send_to_discord_webhook(payload_data, webhook_type, is_brainrot_150m=False):
-    """Envia embed para o Discord"""
+def send_to_discord_webhook_async(embed_data, webhook_type):
+    """Envia embed para o Discord de forma assíncrona"""
+    return executor.submit(send_to_discord_webhook_sync, embed_data, webhook_type)
+
+def send_to_discord_webhook_sync(embed_data, webhook_type):
+    """Função síncrona para enviar ao Discord"""
     if webhook_type not in WEBHOOKS:
-        logger.error(f"Webhook type não encontrado: {webhook_type}")
+        print(f"❌ Webhook type não encontrado: {webhook_type}")
         return False
     
     webhook_url = WEBHOOKS[webhook_type]
     
+    # Construir embed rapidamente
+    embed_info = embed_data.get('embed_info', {})
+    category_info = {
+        "ULTRA_HIGH": {"color": 10181046, "emoji": "💎", "name": "ULTRA HIGH"},
+        "SPECIAL": {"color": 16766720, "emoji": "🔥", "name": "ESPECIAL"},
+        "NORMAL": {"color": 5793266, "emoji": "⭐", "name": "NORMAL"}
+    }
+    
+    category = embed_data.get('category', 'NORMAL')
+    info = category_info.get(category, category_info["NORMAL"])
+    
+    # Formatar server_id rapidamente
+    server_id = embed_data.get('server_id', 'N/A')
+    if not server_id.startswith("```"):
+        server_id = f"```{server_id}```"
+    
+    # Embed otimizado
+    embed = {
+        "title": f"{info['emoji']} {embed_info.get('highest_brainrot', {}).get('name', 'Unknown')}",
+        "description": embed_info.get('description', '')[:200],  # Limitar tamanho
+        "color": info['color'],
+        "fields": [
+            {
+                "name": "🌐 Informações",
+                "value": f"**Jogadores:** {embed_data['players']}/{embed_data['max_players']}\n"
+                        f"**Server ID:** {server_id}\n"
+                        f"**Encontrados:** {embed_data['total_found']}",
+                "inline": False
+            }
+        ],
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "footer": {"text": f"Scanner • {info['name']}"}
+    }
+    
+    payload = {"embeds": [embed]}
+    
     try:
-        response = requests.post(webhook_url, json=payload_data, timeout=10)
+        # Timeout mais curto para resposta rápida
+        response = requests.post(webhook_url, json=payload, timeout=5)
         if response.status_code == 204:
-            if is_brainrot_150m:
-                logger.info(f"🚨 Alerta Brainrot 150M+ enviado com sucesso!")
-            else:
-                logger.info(f"✅ Embed enviado para Discord com sucesso!")
+            print(f"✅ Discord OK: {webhook_type}")
             return True
         else:
-            logger.warning(f"⚠️ Resposta inesperada do Discord: {response.status_code} - {response.text}")
+            print(f"⚠️ Discord {response.status_code}: {webhook_type}")
             return False
-    except requests.exceptions.Timeout:
-        logger.error(f"⚠️ Timeout ao enviar para {webhook_type}")
-        return False
     except Exception as e:
-        logger.error(f"❌ Erro ao enviar para Discord: {e}")
+        print(f"❌ Discord erro: {webhook_type} - {str(e)[:50]}")
         return False
 
-def check_brainrot_150m(embed_data):
-    """Verifica se há brainrot > 150M e prepara alerta"""
-    job_id = embed_data.get('job_id', 'unknown')
-    embed_info = embed_data.get('embed_info', {})
-    top_brainrots = embed_info.get('top_brainrots', [])
+def check_and_send_brainrot_150m_async(embed_data):
+    """Verifica e envia brainrot 150M de forma assíncrona"""
+    return executor.submit(check_and_send_brainrot_150m_sync, embed_data)
+
+def check_and_send_brainrot_150m_sync(embed_data):
+    """Função síncrona para verificar e enviar brainrot 150M"""
+    job_id = embed_data['job_id']
     
-    if was_brainrot_150m_sent(job_id):
-        logger.info(f"📭 Brainrot 150M+ duplicado ignorado: {job_id}")
-        return None
+    # Verificação rápida no cache
+    if was_brainrot_150m_sent_fast(job_id):
+        return False
+    
+    top_brainrots = embed_data.get('embed_info', {}).get('top_brainrots', [])
     
     has_high_brainrot = False
     highest_brainrot = None
     
     for brainrot in top_brainrots:
-        numeric_gen = brainrot.get('numericGen', 0)
-        if numeric_gen >= 150000000:
+        if brainrot.get('numericGen', 0) >= 150000000:
             has_high_brainrot = True
-            if not highest_brainrot or numeric_gen > highest_brainrot.get('numericGen', 0):
+            if not highest_brainrot or brainrot.get('numericGen', 0) > highest_brainrot.get('numericGen', 0):
                 highest_brainrot = brainrot
     
     if not has_high_brainrot:
-        return None
+        return False
     
-    # Construir embed para brainrot 150M (SEM Job ID)
+    # Embed brainrot 150M (SEM Job ID)
     description = "🚨 **Brainrot 150M+ DETECTADO!** 🚨\n\n"
-    for i, brainrot in enumerate(top_brainrots[:5], 1):  # Limitar aos 5 primeiros
-        numeric_gen = brainrot.get('numericGen', 0)
-        if numeric_gen >= 150000000:
-            name = brainrot.get('name', 'Unknown')
-            value_per_second = brainrot.get('valuePerSecond', '0/s')
-            description += f"**{i}º** - {name}: **{value_per_second}**\n"
-    
-    # Formatar Server ID (sem Job ID)
-    server_id = embed_data.get('server_id', 'N/A')
+    for i, brainrot in enumerate(top_brainrots[:3], 1):  # Limitar a 3
+        if brainrot.get('numericGen', 0) >= 150000000:
+            description += f"**{i}º** - {brainrot.get('name', 'Unknown')}: **{brainrot.get('valuePerSecond', '0/s')}**\n"
     
     embed = {
         "title": f"👑 {highest_brainrot.get('name', 'Unknown')}",
         "description": description,
-        "color": 16711680,  # Vermelho
+        "color": 16711680,
         "fields": [
             {
-                "name": "👥 Jogadores no Servidor",
-                "value": f"**{embed_data.get('players', 0)}/{embed_data.get('max_players', 0)}**",
+                "name": "👥 Jogadores",
+                "value": f"**{embed_data['players']}/{embed_data['max_players']}**",
                 "inline": True
             },
             {
@@ -183,187 +228,95 @@ def check_brainrot_150m(embed_data):
             }
         ],
         "timestamp": datetime.utcnow().isoformat() + "Z",
-        "thumbnail": {
-            "url": "https://tr.rbxcdn.com/9f89e27f1fbdcd38ae9259145436f6b7/420/420/Image/Png"
-        },
-        "footer": {
-            "text": "ALERTA BRAINROT 150M+ • Scanner Automático"
-        }
+        "footer": {"text": "ALERTA BRAINROT 150M+"}
     }
     
-    return {
-        "embeds": [embed],
-        "username": "BRAINROT 150M+ ALERT"
-    }
-
-def prepare_normal_embed(data, webhook_type):
-    """Prepara embed normal para Discord (COM Job ID)"""
-    embed_info = data.get('embed_info', {})
-    category_info = {
-        "ULTRA_HIGH": {"color": 10181046, "emoji": "💎", "name": "ULTRA HIGH"},
-        "SPECIAL": {"color": 16766720, "emoji": "🔥", "name": "ESPECIAL"},
-        "NORMAL": {"color": 5793266, "emoji": "⭐", "name": "NORMAL"}
-    }
+    payload = {"embeds": [embed]}
     
-    category = data.get('category', 'NORMAL')
-    info = category_info.get(category, category_info["NORMAL"])
+    try:
+        response = requests.post(WEBHOOKS["BRAINROT_150M_WEBHOOK"], json=payload, timeout=5)
+        if response.status_code == 204:
+            mark_brainrot_150m_sent_fast(job_id)
+            print(f"🚨 Brainrot 150M+ enviado: {job_id}")
+            return True
+    except Exception as e:
+        print(f"❌ Erro brainrot 150M: {str(e)[:50]}")
     
-    # Formatar Server ID e Job ID
-    server_id = data.get('server_id', 'N/A')
-    job_id = data.get('job_id', 'Unknown')
-    
-    # Construir embed
-    embed = {
-        "title": f"{info['emoji']} {embed_info.get('highest_brainrot', {}).get('name', 'Unknown')}",
-        "description": embed_info.get('description', ''),
-        "color": info['color'],
-        "fields": [
-            {
-                "name": "🌐 Informações do Servidor",
-                "value": f"**Jogadores:** {data.get('players', 0)}/{data.get('max_players', 0)}\n"
-                        f"**Server ID:** ```{server_id}```\n"
-                        f"**Job ID:** ```{job_id}```\n"
-                        f"**Total encontrados:** {data.get('total_found', 0)}",
-                "inline": False
-            }
-        ],
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "footer": {
-            "text": f"Scanner Automático • {info['name']}"
-        }
-    }
-    
-    return {
-        "embeds": [embed],
-        "username": "BrainRot Scanner",
-        "avatar_url": "https://tr.rbxcdn.com/9f89e27f1fbdcd38ae9259145436f6b7/420/420/Image/Png"
-    }
-
-def determine_webhook_type(data):
-    """Determina qual webhook usar baseado nos dados"""
-    category = data.get('category', '').upper()
-    player_count = data.get('player_count', 0)
-    embed_info = data.get('embed_info', {})
-    top_brainrots = embed_info.get('top_brainrots', [])
-    
-    # Primeiro verificar Brainrot 150M
-    for brainrot in top_brainrots:
-        if brainrot.get('numericGen', 0) >= 150000000:
-            return "BRAINROT_150M_WEBHOOK"
-    
-    # Depois outras categorias
-    if player_count > 30 or category in ["ULTRA_HIGH", "ULTRA", "VIP", "EXCLUSIVE"]:
-        return "ULTRA_HIGH_WEBHOOK"
-    elif category in ["SPECIAL", "EVENT", "HOLIDAY"]:
-        return "SPECIAL_WEBHOOK"
-    else:
-        return "NORMAL_WEBHOOK"
-
-def discord_worker():
-    """Worker que processa mensagens do Discord em segundo plano"""
-    while True:
-        try:
-            webhook_url, payload_data, is_brainrot_150m, job_id = discord_queue.get()
-            logger.info(f"📤 Processando mensagem na fila (tamanho: {discord_queue.qsize()})")
-            
-            success = send_to_discord_webhook(payload_data, webhook_url, is_brainrot_150m)
-            
-            if success and is_brainrot_150m:
-                mark_brainrot_150m_sent(job_id)
-                logger.info(f"🚨 Alerta brainrot 150M+ processado: {job_id}")
-            
-            discord_queue.task_done()
-        except Exception as e:
-            logger.error(f"Erro no worker Discord: {e}")
-            time.sleep(5)
+    return False
 
 @app.route('/webhook-filter', methods=['POST'])
 def webhook_filter():
-    """Endpoint principal para filtrar e encaminhar webhooks"""
+    """Endpoint principal otimizado para velocidade"""
+    start_time = time.time()
+    
     try:
         data = request.json
         
         if not data:
-            logger.warning("Requisição sem dados recebida")
-            return jsonify({"status": "error", "message": "No data provided"}), 400
+            return jsonify({"status": "error", "message": "No data"}), 400
         
         job_id = data.get('job_id')
         if not job_id:
-            logger.warning("Requisição sem job_id recebida")
-            return jsonify({"status": "error", "message": "No job_id provided"}), 400
+            return jsonify({"status": "error", "message": "No job_id"}), 400
         
-        # Log para debug
-        logger.info(f"\n{'='*50}")
-        logger.info(f"📥 Recebido request do Roblox")
-        logger.info(f"📋 Job ID: {job_id}")
-        logger.info(f"🔤 Server ID: {repr(data.get('server_id', 'N/A'))}")
-        logger.info(f"📊 Dados recebidos - Players: {data.get('players', 0)}/{data.get('max_players', 0)}")
+        # LOG RÁPIDO
+        print(f"\n⚡ Recebido: {job_id}")
         
-        # Verificar se o servidor já foi enviado
-        if was_server_sent(job_id):
-            logger.info(f"📭 Servidor duplicado ignorado: {job_id}")
-            return jsonify({"status": "duplicate", "message": "Server already sent"}), 200
+        # Verificação RÁPIDA no cache
+        if was_server_sent_fast(job_id):
+            print(f"📭 Cache hit: {job_id}")
+            return jsonify({"status": "duplicate", "message": "Already sent"}), 200
         
-        # Determinar webhook type automaticamente
-        webhook_type = determine_webhook_type(data)
-        logger.info(f"🎯 Webhook type determinado: {webhook_type}")
+        webhook_type = data.get('webhook_type', 'NORMAL_WEBHOOK')
         
-        # Verificar brainrot 150M e preparar embed
-        brainrot_embed = check_brainrot_150m(data)
+        # PROCESSAMENTO PARALELO
+        futures = []
         
-        # Preparar payloads para a fila
-        if brainrot_embed and webhook_type == "BRAINROT_150M_WEBHOOK":
-            # Enfileirar alerta brainrot 150M
-            discord_queue.put(("BRAINROT_150M_WEBHOOK", brainrot_embed, True, job_id))
-            logger.info(f"🔥 Alerta Brainrot 150M+ enfileirado: {job_id}")
+        # 1. Verificar brainrot 150M (paralelo)
+        futures.append(check_and_send_brainrot_150m_async(data))
         
-        # Sempre enfileirar embed normal (se não for brainrot 150M)
-        if webhook_type != "BRAINROT_150M_WEBHOOK":
-            normal_embed = prepare_normal_embed(data, webhook_type)
-            discord_queue.put((webhook_type, normal_embed, False, job_id))
-            logger.info(f"📡 Embed normal enfileirado: {job_id} -> {webhook_type}")
+        # 2. Enviar para webhook normal (paralelo)
+        if webhook_type in WEBHOOKS:
+            futures.append(send_to_discord_webhook_async(data, webhook_type))
         
-        # Marcar como enviado imediatamente (para evitar duplicatas)
+        # 3. Marcar como enviado (no cache primeiro)
         category = data.get('category', 'UNKNOWN')
-        mark_server_sent(job_id, webhook_type, category)
+        mark_server_sent_fast(job_id, webhook_type, category)
         
-        logger.info(f"✅ Request processado com sucesso")
-        logger.info(f"📊 Fila atual: {discord_queue.qsize()} mensagens")
-        logger.info(f"{'='*50}")
+        # Responder IMEDIATAMENTE sem esperar pelos resultados
+        processing_time = (time.time() - start_time) * 1000
+        print(f"✅ Processado em {processing_time:.1f}ms")
         
         return jsonify({
-            "status": "success",
-            "message": "Received and queued for processing",
+            "status": "queued",
+            "message": "Processing started",
             "job_id": job_id,
-            "webhook_type": webhook_type,
-            "queue_position": discord_queue.qsize(),
-            "server_id": data.get('server_id', 'unknown'),
-            "processing_mode": "async"
+            "processing_time_ms": processing_time,
+            "parallel_tasks": len(futures)
         }), 200
             
     except Exception as e:
-        logger.error(f"❌ Erro no servidor Python: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
+        error_time = (time.time() - start_time) * 1000
+        print(f"❌ Erro em {error_time:.1f}ms: {str(e)[:100]}")
+        return jsonify({"status": "error", "message": "Server error"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Endpoint de verificação de saúde"""
+    """Health check otimizado"""
     return jsonify({
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "queue_size": discord_queue.qsize(),
-        "active_threads": threading.active_count()
+        "cache_size": len(server_cache),
+        "thread_pool": executor._max_workers
     }), 200
 
 @app.route('/servers', methods=['GET'])
 def list_servers():
-    """Lista todos os servidores enviados"""
+    """Lista servidores (otimizado)"""
     try:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT job_id, timestamp, webhook_type, category FROM sent_servers ORDER BY timestamp DESC LIMIT 20")
+        c.execute("SELECT job_id, timestamp, webhook_type FROM sent_servers ORDER BY timestamp DESC LIMIT 10")
         servers = c.fetchall()
         conn.close()
         
@@ -372,124 +325,61 @@ def list_servers():
             server_list.append({
                 "job_id": server[0],
                 "timestamp": server[1],
-                "webhook_type": server[2],
-                "category": server[3]
+                "webhook_type": server[2]
             })
         
         return jsonify({
             "status": "success", 
             "servers": server_list, 
             "count": len(server_list),
-            "queue_size": discord_queue.qsize()
+            "cache_hits": len(server_cache)
         }), 200
     except Exception as e:
-        logger.error(f"Erro ao listar servidores: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/queue-status', methods=['GET'])
-def queue_status():
-    """Status da fila de processamento"""
-    return jsonify({
-        "queue_size": discord_queue.qsize(),
-        "queue_unfinished_tasks": discord_queue.unfinished_tasks,
-        "active_threads": threading.active_count(),
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/test-webhook/<webhook_type>', methods=['GET'])
-def test_webhook(webhook_type):
-    """Testar conexão com webhook do Discord"""
-    if webhook_type not in WEBHOOKS:
-        return jsonify({"status": "error", "message": "Webhook type not found"}), 404
-    
-    test_data = {
-        "embeds": [{
-            "title": "🧪 Teste de Webhook",
-            "description": f"Testando {webhook_type}",
-            "color": 0x00FF00,
-            "timestamp": datetime.now().isoformat(),
-            "fields": [
-                {
-                    "name": "Status",
-                    "value": "✅ Funcionando corretamente",
-                    "inline": True
-                },
-                {
-                    "name": "Hora",
-                    "value": datetime.now().strftime("%H:%M:%S"),
-                    "inline": True
-                }
-            ]
-        }]
-    }
-    
-    try:
-        response = requests.post(WEBHOOKS[webhook_type], json=test_data, timeout=10)
-        return jsonify({
-            "status": "success",
-            "webhook": webhook_type,
-            "discord_status": response.status_code,
-            "message": "Test sent successfully",
-            "timestamp": datetime.now().isoformat()
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "webhook": webhook_type,
-            "message": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
-
-def cleanup_old_entries():
-    """Limpa entradas antigas do banco de dados"""
+def background_cleanup():
+    """Limpeza em background"""
     while True:
         try:
+            # Limpar cache antigo
+            with cache_lock:
+                # Manter apenas as últimas 1000 entradas no cache
+                if len(server_cache) > 1000:
+                    # Remover entradas antigas (simplificado)
+                    keys_to_remove = list(server_cache.keys())[:len(server_cache) - 800]
+                    for key in keys_to_remove:
+                        del server_cache[key]
+                    print(f"🧹 Cache limpo: {len(keys_to_remove)} entradas")
+            
+            # Limpar banco (menos frequente)
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            # Remove entradas com mais de 24 horas
-            c.execute("DELETE FROM sent_servers WHERE timestamp < datetime('now', '-24 hours')")
-            c.execute("DELETE FROM sent_brainrot_150m WHERE timestamp < datetime('now', '-24 hours')")
+            c.execute("DELETE FROM sent_servers WHERE timestamp < datetime('now', '-12 hours')")
+            c.execute("DELETE FROM sent_brainrot_150m WHERE timestamp < datetime('now', '-12 hours')")
             deleted = conn.total_changes
             conn.commit()
             conn.close()
             if deleted > 0:
-                logger.info(f"🧹 Banco de dados limpo: {deleted} entradas removidas")
+                print(f"🗑️ Banco limpo: {deleted} entradas")
+                
         except Exception as e:
-            logger.error(f"Erro ao limpar banco: {e}")
+            print(f"Erro na limpeza: {e}")
         
-        # Executa a cada hora
-        time.sleep(3600)
+        time.sleep(300)  # A cada 5 minutos
 
 if __name__ == '__main__':
-    # Inicializar banco de dados
+    print("🚀 Iniciando API OTIMIZADA para velocidade...")
     init_db()
     
-    # Iniciar worker do Discord em thread separada
-    discord_worker_thread = threading.Thread(target=discord_worker, daemon=True)
-    discord_worker_thread.start()
+    # Iniciar limpeza em background
+    threading.Thread(target=background_cleanup, daemon=True).start()
     
-    # Iniciar thread de limpeza
-    cleanup_thread = threading.Thread(target=cleanup_old_entries, daemon=True)
-    cleanup_thread.start()
+    print("✅ API pronta! Envios serão MUITO mais rápidos!")
+    print("🔧 Otimizações aplicadas:")
+    print("   • Cache em memória para verificações instantâneas")
+    print("   • Thread pool para envios paralelos")
+    print("   • Resposta imediata ao Roblox")
+    print("   • Timeouts curtos (5s) para Discord")
+    print("   • Processamento em background")
     
-    logger.info("\n" + "="*60)
-    logger.info("🚀 BRAINROT SCANNER API - INICIADA")
-    logger.info("="*60)
-    logger.info("🔗 Endpoints disponíveis:")
-    logger.info("   POST /webhook-filter    - Receber dados do Roblox")
-    logger.info("   GET  /health            - Health check")
-    logger.info("   GET  /servers           - Lista de servidores")
-    logger.info("   GET  /queue-status      - Status da fila")
-    logger.info("   GET  /test-webhook/<type> - Testar webhook Discord")
-    logger.info("="*60)
-    logger.info("🎯 Funcionalidades:")
-    logger.info("   • Brainrot 150M+ (SEM Job ID na embed)")
-    logger.info("   • Processamento assíncrono")
-    logger.info("   • Prevenção de duplicatas")
-    logger.info("   • Detecção automática de categoria")
-    logger.info("="*60)
-    logger.info("✅ API PRONTA!")
-    logger.info("="*60)
-    
-    # Iniciar servidor Flask
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
