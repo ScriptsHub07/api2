@@ -10,10 +10,10 @@ app = Flask(__name__)
 
 # Configuração dos webhooks
 WEBHOOKS = {
-    "NORMAL_WEBHOOK": "https://ptb.discord.com/api/webhooks/1455361732523327730/aCZn_oDnIDjOoHzCkrPk_x9ohfSFWSO9kNzkSFo0kYNxmZIyrOcrrqSN80S3tQs_LINk",
-    "SPECIAL_WEBHOOK": "https://ptb.discord.com/api/webhooks/1455361536078905479/IptfKoKAO-imuZ39zysfeIBoHb-0ZIqOHkYHTc2AA7TqscwZA5xn8vKQmc4RbgJ5rZUP",
-    "ULTRA_HIGH_WEBHOOK": "https://ptb.discord.com/api/webhooks/1455361629880582239/tpNHrWPlXGi8SyStifJ-A0mMYHLSIkP2kE_UzW6rZRRbS8xtLxmN1CvIk7081pbdo6eX",
-    "BRAINROT_150M_WEBHOOK": "https://ptb.discord.com/api/webhooks/1455430968575000729/4GH6iNeP3K6EeCtmFja1KzYxqGSICaXxtJURaZVq9LWzSsT9SwKGVw2ZqVUzMAqhFQpf"
+    "NORMAL_WEBHOOK": "https://discord.com/api/webhooks/1450539120274313449/rLk9My7PAHiC26tjJ-jr05BjpeLGj8h1cCBLMx2KYybtuVAPGOAOa6Rc4AVn4w4_rjbg",
+    "SPECIAL_WEBHOOK": "https://discord.com/api/webhooks/1450539120274313449/rLk9My7PAHiC26tjJ-jr05BjpeLGj8h1cCBLMx2KYybtuVAPGOAOa6Rc4AVn4w4_rjbg",
+    "ULTRA_HIGH_WEBHOOK": "https://discord.com/api/webhooks/1450539120274313449/rLk9My7PAHiC26tjJ-jr05BjpeLGj8h1cCBLMx2KYybtuVAPGOAOa6Rc4AVn4w4_rjbg",
+    "BRAINROT_150M_WEBHOOK": "https://discord.com/api/webhooks/1450539120274313449/rLk9My7PAHiC26tjJ-jr05BjpeLGj8h1cCBLMx2KYybtuVAPGOAOa6Rc4AVn4w4_rjbg"
 }
 
 # Configuração do banco de dados
